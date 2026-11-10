@@ -1,0 +1,6 @@
+build/
+artifacts/
+data/
+*.zst
+*.log
+__pycache__/

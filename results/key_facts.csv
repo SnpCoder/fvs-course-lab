@@ -1,0 +1,13 @@
+key,value
+low_baseline_L320,34.30% / 559.9 us / 4.38 IO
+low_seed20_L320,90.55% / 394.8 us / 19.77 IO
+low_seed40_L320,97.20% / 517.6 us / 39.24 IO
+low_seed40_L640,97.25% / 547.0 us / 39.24 IO
+low_baseline_L640,51.80% / 960.6 us / 7.72 IO
+low_seed40_plus_graph,35.90% / 724.6 us / 6.53 IO
+low_bfs2,"94.90% / 5050.5 us / 78.95 IO, skips=51014"
+rss_baseline_mib,415.9
+rss_seed40_mib,416.0
+seed40_delta_recall_pp,62.90
+seed40_delta_latency_pct,-7.6
+seed40_delta_ios_pct,795.9

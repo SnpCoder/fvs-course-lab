@@ -1,0 +1,479 @@
+From d04612d972342d22b48de4a78c5354f1c0764ea4 Mon Sep 17 00:00:00 2001
+From: Course Experiment <experiment@local>
+Date: Thu, 29 Oct 2026 21:23:18 +0800
+Subject: [PATCH] Explore rare-label seeding and valid-frontier tunneling
+
+---
+ include/ssd_index.h                |   3 +-
+ include/utils/percentile_stats.h   |   5 +
+ include/utils/spmat_filter_store.h |  52 ++++++++
+ src/search/pipe_search.cpp         | 201 +++++++++++++++++++++++++----
+ tests/search_disk_index_yfcc.cpp   |  61 ++++++++-
+ 5 files changed, 294 insertions(+), 28 deletions(-)
+
+diff --git a/include/ssd_index.h b/include/ssd_index.h
+index 7bd2945..d7e72f5 100644
+--- a/include/ssd_index.h
++++ b/include/ssd_index.h
+@@ -175,7 +175,8 @@ namespace pipeann {
+     size_t pipe_search(const T *query, const uint64_t k_search, const uint32_t mem_L, const uint64_t l_search,
+                        TagT *res_tags, float *res_dists, const uint64_t beam_width, QueryStats *stats = nullptr,
+                        AbstractSelector *selector = nullptr, const void *filter_data = nullptr,
+-                       const uint64_t relaxed_monotonicity_l = 0);
++                       const uint64_t relaxed_monotonicity_l = 0,
++                       const std::vector<uint32_t> *seed_ids = nullptr);
+ 
+     // Hot node cache for workload-aware search
+     void init_cache(size_t max_nodes) {
+diff --git a/include/utils/percentile_stats.h b/include/utils/percentile_stats.h
+index 6e9802a..d894367 100644
+--- a/include/utils/percentile_stats.h
++++ b/include/utils/percentile_stats.h
+@@ -24,6 +24,11 @@ namespace pipeann {
+     double n_hops = 0;          // # search hops
+     double n_current_used = 0;  // # force return for latency limit
+     double n_filter_skip = 0;   // # nodes skipped by pre-IO filter check (mode=8)
++    double n_tunnel_valid = 0;  // # valid nodes found inside a tunnel frontier
++    double n_tunnel_invalid = 0;  // # invalid nodes inspected inside a tunnel frontier
++    double n_seed_candidates = 0;  // # label-posting candidates used to seed retset
++    double n_seed_inserted = 0;    // # seeds retained in the initial frontier
++    double n_seed_valid = 0;       // # retained seeds that pass the exact filter
+ 
+     // Time breakdown (microseconds, mode=8 filter-aware search)
+     double bd_io_us = 0;        // IO submit + poll + wait
+diff --git a/include/utils/spmat_filter_store.h b/include/utils/spmat_filter_store.h
+index 48b5d26..c45d988 100644
+--- a/include/utils/spmat_filter_store.h
++++ b/include/utils/spmat_filter_store.h
+@@ -58,6 +58,7 @@ class SpmatFilterStore {
+ 
+     // Build CSR: flatten into indptr_ (int64) and labels_ (uint32)
+     n_nodes_ = (uint32_t)nrow;
++    n_cols_ = (uint32_t)ncol;
+     indptr_.resize(nrow + 1);
+ 
+     // First pass: count non-zero entries per row
+@@ -137,12 +138,63 @@ class SpmatFilterStore {
+ 
+   bool loaded() const { return n_nodes_ > 0; }
+   size_t size() const { return n_nodes_; }
++  size_t n_cols() const { return n_cols_; }
++
++  // Build label -> sorted node-ID postings once. This is an exploration-only
++  // side structure: it costs ~43 MiB for the 1M YFCC base and is not built in
++  // the original baseline path.
++  void build_inverted() {
++    if (inverted_built_ || n_nodes_ == 0 || n_cols_ == 0) return;
++    label_offsets_.assign(n_cols_ + 1, 0);
++    for (uint32_t label : labels_) {
++      if (label < n_cols_) label_offsets_[label + 1]++;
++    }
++    for (uint32_t label = 0; label < n_cols_; ++label) {
++      label_offsets_[label + 1] += label_offsets_[label];
++    }
++    label_ids_.resize(total_labels_);
++    std::vector<uint64_t> pos(label_offsets_.begin(), label_offsets_.end() - 1);
++    for (uint32_t node = 0; node < n_nodes_; ++node) {
++      for (int64_t j = indptr_[node]; j < indptr_[node + 1]; ++j) {
++        uint32_t label = labels_[j];
++        if (label < n_cols_) label_ids_[pos[label]++] = node;
++      }
++    }
++    inverted_built_ = true;
++    double mem_mb = (label_offsets_.size() * 8 + label_ids_.size() * 4) / (1024.0 * 1024.0);
++    LOG(INFO) << "SpmatFilterStore inverted index: " << n_cols_ << " labels, "
++              << label_ids_.size() << " postings, " << std::fixed << std::setprecision(1)
++              << mem_mb << " MB";
++  }
++
++  bool inverted() const { return inverted_built_; }
++
++  // Returns a pointer to the sorted node IDs containing label; n=0 if absent.
++  const uint32_t *posting(uint32_t label, uint32_t &n) const {
++    if (!inverted_built_ || label >= n_cols_) {
++      n = 0;
++      return nullptr;
++    }
++    uint64_t begin = label_offsets_[label];
++    uint64_t end = label_offsets_[label + 1];
++    n = (uint32_t) (end - begin);
++    return label_ids_.data() + begin;
++  }
++
++  size_t posting_size(uint32_t label) const {
++    if (!inverted_built_ || label >= n_cols_) return 0;
++    return (size_t) (label_offsets_[label + 1] - label_offsets_[label]);
++  }
+ 
+  private:
+   uint32_t n_nodes_ = 0;
++  uint32_t n_cols_ = 0;
+   int64_t total_labels_ = 0;
++  bool inverted_built_ = false;
+   std::vector<int64_t> indptr_;     // n_nodes+1 entries
+   std::vector<uint32_t> labels_;    // flattened sorted labels
++  std::vector<uint64_t> label_offsets_;  // n_cols+1
++  std::vector<uint32_t> label_ids_;      // total_labels postings
+ };
+ 
+ }  // namespace pipeann
+diff --git a/src/search/pipe_search.cpp b/src/search/pipe_search.cpp
+index 65bd1c9..f50e6cf 100644
+--- a/src/search/pipe_search.cpp
++++ b/src/search/pipe_search.cpp
+@@ -3,6 +3,7 @@
+ #include "ssd_index.h"
+ #include <malloc.h>
+ #include <algorithm>
++#include <cstdlib>
+ #ifndef USE_AIO
+ #include "liburing.h"
+ #endif
+@@ -42,7 +43,8 @@ namespace pipeann {
+   size_t SSDIndex<T, TagT>::pipe_search(const T *query1, const uint64_t k_search, const uint32_t mem_L,
+                                         const uint64_t l_search, TagT *res_tags, float *distances,
+                                         const uint64_t beam_width, QueryStats *stats, AbstractSelector *selector,
+-                                        const void *filter_data, const uint64_t relaxed_monotonicity_l) {
++                                        const void *filter_data, const uint64_t relaxed_monotonicity_l,
++                                        const std::vector<uint32_t> *seed_ids) {
+     QueryBuffer<T> *query_buf = pop_query_buf(query1);
+ #ifdef USE_AIO
+     void *ctx = reader->get_ctx();
+@@ -79,6 +81,32 @@ namespace pipeann {
+     Timer query_timer;
+ 
+     const unsigned effective_lsearch = l_search;
++
++    // Exploration-only switches. Default is the original course behavior.
++    // GATEANN_TUNNEL_VALID_FRONTIER=1 enables the valid-frontier variant.
++    static const bool valid_frontier_enabled = []() {
++      const char *e = std::getenv("GATEANN_TUNNEL_VALID_FRONTIER");
++      return e != nullptr && std::atoi(e) != 0;
++    }();
++    static const int valid_frontier_hops = []() {
++      const char *e = std::getenv("GATEANN_TUNNEL_HOPS");
++      int h = e == nullptr ? 2 : std::atoi(e);
++      return std::max(1, std::min(4, h));
++    }();
++    static const int valid_frontier_max_nodes = []() {
++      const char *e = std::getenv("GATEANN_TUNNEL_MAX_NODES");
++      int n = e == nullptr ? 512 : std::atoi(e);
++      return std::max(32, std::min((int) MAX_N_EDGES, n));
++    }();
++    static const bool seed_only = []() {
++      const char *e = std::getenv("GATEANN_SEED_ONLY");
++      return e != nullptr && std::atoi(e) != 0;
++    }();
++    static const int seed_limit_env = []() {
++      const char *e = std::getenv("GATEANN_SEED_LIMIT");
++      int n = e == nullptr ? 80 : std::atoi(e);
++      return std::max(1, std::min(1024, n));
++    }();
+     std::vector<Neighbor> retset(mem_L + this->params.R + effective_lsearch * 10);
+     auto &visited = *(query_buf->visited);
+     unsigned cur_list_size = 0;
+@@ -229,6 +257,61 @@ namespace pipeann {
+     std::sort(retset.begin(), retset.begin() + cur_list_size);
+ #endif
+ 
++    // Exploration-only label-first seeding: if the caller supplies a posting
++    // list (rare labels), compute PQ distances for all its nodes and keep the
++    // best L as the initial frontier. The normal pre-I/O filter and exact rerank
++    // still run, so filtering semantics are unchanged.
++    if (seed_ids != nullptr && !seed_ids->empty()) {
++      const size_t seed_limit = std::min((size_t) effective_lsearch, (size_t) seed_limit_env);
++      std::priority_queue<Neighbor> seed_heap;
++      size_t i = 0;
++      while (i < seed_ids->size()) {
++        size_t n = std::min((size_t) MAX_N_EDGES, seed_ids->size() - i);
++        nbr_handler->compute_dists(query_buf, seed_ids->data() + i, (unsigned) n);
++        for (size_t j = 0; j < n; ++j) {
++          uint32_t id = (*seed_ids)[i + j];
++          if (visited.find(id) != visited.end()) continue;
++          seed_heap.push(Neighbor(id, dist_scratch[j], true));
++          if (seed_heap.size() > seed_limit) seed_heap.pop();
++        }
++        i += n;
++      }
++      if (stats != nullptr) {
++        stats->n_seed_candidates += (double) seed_ids->size();
++        stats->n_cmps += (double) seed_ids->size();
++      }
++
++      std::vector<Neighbor> merged;
++      merged.reserve(seed_limit + cur_list_size);
++      for (unsigned j = 0; j < cur_list_size; ++j) merged.push_back(retset[j]);
++      while (!seed_heap.empty()) {
++        merged.push_back(seed_heap.top());
++        seed_heap.pop();
++      }
++      std::sort(merged.begin(), merged.end());
++
++      cur_list_size = 0;
++      for (const Neighbor &nn : merged) {
++        if (cur_list_size >= seed_limit) break;
++        bool duplicate = false;
++        for (unsigned j = 0; j < cur_list_size; ++j) {
++          if (retset[j].id == nn.id) {
++            duplicate = true;
++            break;
++          }
++        }
++        if (duplicate) continue;
++        retset[cur_list_size++] = nn;
++        visited.insert(nn.id);
++      }
++      if (stats != nullptr) {
++        stats->n_seed_inserted += (double) cur_list_size;
++        for (unsigned j = 0; j < cur_list_size; ++j) {
++          if (this->check_filter(retset[j].id, filter_data)) stats->n_seed_valid++;
++        }
++      }
++    }
++
+     std::queue<io_t> on_flight_ios;
+     auto send_read_req = [&](Neighbor &item) -> bool {
+       item.flag = false;
+@@ -311,35 +394,99 @@ namespace pipeann {
+             auto bd_tunnel_st = std::chrono::high_resolution_clock::now();
+             retset[marker].flag    = false;
+             retset[marker].visited = true;
+-            // Tunnel: expand neighbors for free via full_adj_
++            // Tunnel: expand neighbors for free via full_adj_.
++            // Baseline: insert every one-hop neighbor into retset, so invalid
++            // nodes consume L slots. Valid-frontier variant: BFS through
++            // invalid nodes with a separate bounded frontier, and insert only
++            // filter-passing nodes into retset.
+             if (this->tunneling_loaded()) {
+-              uint32_t nnbrs;
+-              const uint32_t *nbrs;
+-              this->tunneling_get_adj(retset[marker].id, nnbrs, nbrs);
+-              uint32_t temp_nbrs[MAX_N_EDGES];
+-              unsigned cnt = 0;
+-              for (unsigned m = 0; m < nnbrs; m++) {
+-                if (visited.find(nbrs[m]) == visited.end()) {
+-                  temp_nbrs[cnt++] = nbrs[m];
+-                  visited.insert(nbrs[m]);
++              if (!valid_frontier_enabled) {
++                uint32_t nnbrs;
++                const uint32_t *nbrs;
++                this->tunneling_get_adj(retset[marker].id, nnbrs, nbrs);
++                uint32_t temp_nbrs[MAX_N_EDGES];
++                unsigned cnt = 0;
++                for (unsigned m = 0; m < nnbrs; m++) {
++                  if (visited.find(nbrs[m]) == visited.end()) {
++                    temp_nbrs[cnt++] = nbrs[m];
++                    visited.insert(nbrs[m]);
++                  }
+                 }
+-              }
+-              if (cnt > 0) {
+-                nbr_handler->compute_dists(query_buf, temp_nbrs, cnt);
+-                for (unsigned m = 0; m < cnt; m++) {
+-                  float d = dist_scratch[m];
+-                  if (cur_list_size < effective_lsearch ||
+-                      d < retset[cur_list_size - 1].distance) {
+-                    Neighbor nn(temp_nbrs[m], d, true);
+-                    auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
+-                    if (cur_list_size < effective_lsearch) ++cur_list_size;
+-                    if (r < marker) marker = r;  // rescan if inserted before marker
++                if (cnt > 0) {
++                  nbr_handler->compute_dists(query_buf, temp_nbrs, cnt);
++                  for (unsigned m = 0; m < cnt; m++) {
++                    float d = dist_scratch[m];
++                    if (cur_list_size < effective_lsearch ||
++                        d < retset[cur_list_size - 1].distance) {
++                      Neighbor nn(temp_nbrs[m], d, true);
++                      auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
++                      if (cur_list_size < effective_lsearch) ++cur_list_size;
++                      if (r < marker) marker = r;  // rescan if inserted before marker
++                    }
++                  }
++                }
++                if (stats != nullptr) {
++                  stats->n_filter_skip++;
++                }
++              } else {
++                struct TunnelNode {
++                  uint32_t id;
++                  uint8_t depth;
++                };
++                std::vector<TunnelNode> frontier;
++                std::vector<uint32_t> valid_ids;
++                frontier.reserve(64);
++                valid_ids.reserve(32);
++                frontier.push_back({retset[marker].id, 0});
++                if (stats != nullptr) stats->n_tunnel_invalid++;  // the root itself
++
++                size_t head = 0;
++                int inspected = 0;
++                while (head < frontier.size() && inspected < valid_frontier_max_nodes) {
++                  TunnelNode cur = frontier[head++];
++                  ++inspected;
++                  if (cur.depth >= valid_frontier_hops) {
++                    continue;
++                  }
++                  uint32_t nnbrs2;
++                  const uint32_t *nbrs2;
++                  this->tunneling_get_adj(cur.id, nnbrs2, nbrs2);
++                  for (unsigned m = 0; m < nnbrs2; m++) {
++                    uint32_t nid = nbrs2[m];
++                    if (visited.find(nid) != visited.end()) {
++                      continue;
++                    }
++                    visited.insert(nid);
++                    if (this->check_filter(nid, filter_data)) {
++                      valid_ids.push_back(nid);
++                      if (stats != nullptr) stats->n_tunnel_valid++;
++                    } else {
++                      frontier.push_back({nid, (uint8_t) (cur.depth + 1)});
++                      if (stats != nullptr) stats->n_tunnel_invalid++;
++                    }
++                  }
++                }
++                if (stats != nullptr) {
++                  stats->n_filter_skip += inspected;
++                }
++                if (!valid_ids.empty()) {
++                  nbr_handler->compute_dists(query_buf, valid_ids.data(), (unsigned) valid_ids.size());
++                  for (size_t m = 0; m < valid_ids.size(); m++) {
++                    float d = dist_scratch[m];
++                    if (cur_list_size < effective_lsearch ||
++                        d < retset[cur_list_size - 1].distance) {
++                      Neighbor nn(valid_ids[m], d, true);
++                      auto r = InsertIntoPool(retset.data(), cur_list_size, nn);
++                      if (cur_list_size < effective_lsearch) ++cur_list_size;
++                      if (r < marker) marker = r;
++                    }
+                   }
+                 }
+               }
++            } else if (stats != nullptr) {
++              stats->n_filter_skip++;
+             }
+             if (stats != nullptr) {
+-              stats->n_filter_skip++;
+               auto bd_tunnel_ed = std::chrono::high_resolution_clock::now();
+               stats->bd_tunnel_us += std::chrono::duration_cast<std::chrono::nanoseconds>(bd_tunnel_ed - bd_tunnel_st).count() / 1000.0;
+             }
+@@ -378,8 +525,12 @@ namespace pipeann {
+           retset[marker].visited = true;
+           auto it = id_buf_map.find(retset[marker].id);
+           auto &[id, node] = *it;
+-          // Mode=9 early filter check: skip exact distance for non-matching nodes
+-          if (this->early_filter_check_ && filter_data != nullptr &&
++          if (seed_only && seed_ids != nullptr) {
++            // Rare-label path: the posting list is the candidate universe.
++            // Only exact rerank is needed; expanding SSD neighbors would
++            // reintroduce invalid frontier nodes and evict unread seeds.
++            compute_exact_dists_and_push(node, id);
++          } else if (this->early_filter_check_ && filter_data != nullptr &&
+               this->filter_store_ && this->filter_store_->loaded() &&
+               !this->check_filter(id, filter_data)) {
+             compute_and_push_nbrs(node, nk);
+diff --git a/tests/search_disk_index_yfcc.cpp b/tests/search_disk_index_yfcc.cpp
+index e193967..a5f1a73 100644
+--- a/tests/search_disk_index_yfcc.cpp
++++ b/tests/search_disk_index_yfcc.cpp
+@@ -17,6 +17,8 @@
+ 
+ #include <omp.h>
+ #include <iomanip>
++#include <algorithm>
++#include <cstdlib>
+ #include <fstream>
+ #include <string>
+ #include <vector>
+@@ -190,6 +192,21 @@ int run(int argc, char **argv) {
+   // Load SpmatFilterStore (base metadata in DRAM)
+   idx_->load_spmat_filter_store(base_meta_path);
+ 
++  // Exploration-only: build label -> node postings when explicitly enabled.
++  // Keeping this off preserves the original course memory footprint.
++  const bool label_seeds_enabled = []() {
++    const char *e = std::getenv("GATEANN_LABEL_SEEDS");
++    return e != nullptr && std::atoi(e) != 0;
++  }();
++  const uint32_t label_seed_max = []() {
++    const char *e = std::getenv("GATEANN_LABEL_SEED_MAX");
++    int n = e == nullptr ? 10000 : std::atoi(e);
++    return (uint32_t) std::max(1, n);
++  }();
++  if (label_seeds_enabled) {
++    idx_->get_spmat_filter()->build_inverted();
++  }
++
+   // Cache warmup
+   if (cache_budget > 0) {
+     idx_->init_cache(cache_budget);
+@@ -244,11 +261,27 @@ int run(int argc, char **argv) {
+     for (int64_t i = 0; i < (int64_t)query_num; i++) {
+       const void *ql = query_labels.get(i);
+       if (is_fa) {
+-        // mode=8: pre-IO filter + tunneling
++        // mode=8: pre-IO filter + tunneling. Optionally seed the initial
++        // frontier from the label posting list for rare labels.
++        std::vector<uint32_t> seeds;
++        const std::vector<uint32_t> *seed_ptr = nullptr;
++        if (label_seeds_enabled) {
++          uint32_t q_count = *reinterpret_cast<const uint32_t *>(ql);
++          const uint32_t *q_labels = reinterpret_cast<const uint32_t *>(
++              reinterpret_cast<const char *>(ql) + sizeof(uint32_t));
++          if (q_count == 1) {
++            uint32_t n = 0;
++            const uint32_t *ids = idx_->get_spmat_filter()->posting(q_labels[0], n);
++            if (ids != nullptr && n > 0 && n <= label_seed_max) {
++              seeds.assign(ids, ids + n);
++              seed_ptr = &seeds;
++            }
++          }
++        }
+         idx_->pipe_search(query + i * query_dim, recall_at, mem_L, L,
+                           res_buf.data() + i * recall_at,
+                           nullptr, beamwidth, &stats[i],
+-                          nullptr, ql);
++                          nullptr, ql, 0, seed_ptr);
+       } else {
+         // mode=2: PipeANN pipe_search + post-filter via selector
+         idx_->pipe_search(query + i * query_dim, recall_at, mem_L, L,
+@@ -278,6 +311,21 @@ int run(int argc, char **argv) {
+     double mean_bd_process = pipeann::get_mean_stats(
+         stats.data(), query_num,
+         [](const pipeann::QueryStats &s) { return s.bd_process_us; });
++    double mean_tunnel_valid = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_tunnel_valid; });
++    double mean_tunnel_invalid = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_tunnel_invalid; });
++    double mean_seed_candidates = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_seed_candidates; });
++    double mean_seed_inserted = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_seed_inserted; });
++    double mean_seed_valid = pipeann::get_mean_stats(
++        stats.data(), query_num,
++        [](const pipeann::QueryStats &s) { return s.n_seed_valid; });
+ 
+     std::cout << std::setw(6)  << L
+               << std::setw(12) << std::fixed << std::setprecision(0) << qps
+@@ -288,6 +336,15 @@ int run(int argc, char **argv) {
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_tunnel
+               << std::setw(12) << std::fixed << std::setprecision(0) << mean_bd_process
+               << std::endl;
++    std::cerr << "TUNNELSTATS L=" << L
++              << " tunnel_valid=" << std::fixed << std::setprecision(2) << mean_tunnel_valid
++              << " tunnel_invalid=" << mean_tunnel_invalid
++              << " mean_ios=" << mean_ios
++              << " filter_skips=" << mean_filter_skip
++              << " seed_candidates=" << mean_seed_candidates
++              << " seed_inserted=" << mean_seed_inserted
++              << " seed_valid=" << mean_seed_valid
++              << std::endl;
+   }
+ 
+   delete[] query;
+-- 
+2.34.1
+
